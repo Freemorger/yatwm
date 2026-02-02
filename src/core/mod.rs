@@ -1,7 +1,8 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use log::error;
-use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, WindowClass}}, rust_connection::RustConnection};
+use indexmap::IndexMap;
+use log::{error, info};
+use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
 use crate::core::cfgread::Config;
 
@@ -34,11 +35,8 @@ impl WM {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let scr_num = self.state.scr_num;
-        let screen = &self.state.conn.setup().roots[scr_num];
-
         self.state.conn.change_window_attributes(
-            screen.root,
+            self.state.screen.root,
             &ChangeWindowAttributesAux::new().event_mask(
                 EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY
             ),
@@ -79,16 +77,20 @@ impl WM {
 
 pub struct YATState<C: Connection> {
     conn: C,
-    windows: HashMap<u32, YATWindow>,
+    windows: IndexMap<u32, YATWindow>,
     scr_num: usize,
+    screen: Screen,
 }
 
 impl<C: Connection> YATState<C> {
     pub fn new(conn: C, scr_num: usize) -> YATState<C> {
+        let scr = conn.setup().roots[scr_num].clone();
+
         YATState { 
             conn: conn, 
-            windows: HashMap::new(),
+            windows: IndexMap::new(),
             scr_num: scr_num,
+            screen: scr,
         }
     }
 
@@ -102,7 +104,7 @@ impl<C: Connection> YATState<C> {
                 self.conn.flush()?;
             }
             Event::MapRequest(e) => {
-                let (x, y, w, h) = self.calc_cords();
+                let (x, y, w, h) = self.calc_cords(1)?;
                 let new_win = YATWindow::new(
                     e.window, x, y
                 );
@@ -122,6 +124,10 @@ impl<C: Connection> YATState<C> {
 
                 self.windows.insert(e.window, new_win);
             }
+            Event::UnmapNotify(e) => {
+                self.windows.remove(&e.window);
+                self.update_all_sizes(0)?; // already removed
+            }            
             other => {
                 // TODO
             }
@@ -130,9 +136,52 @@ impl<C: Connection> YATState<C> {
     }
 
     /// Calculate pos and size of new window (posx, posy, sizex, sizey)
-    fn calc_cords(&mut self) -> (u32, u32, u32, u32) { 
-        // TODO 
-        (0, 0, 400, 500)
+    fn calc_cords(&mut self, delta: i16) -> 
+            Result<(u32, u32, u32, u32), Box<dyn std::error::Error>> { 
+        let scr_height = self.screen.height_in_pixels;
+        let scr_width = self.screen.width_in_pixels;
+    
+        let wind_width = self.update_all_sizes(delta)?; 
+
+        Ok((
+            (scr_width - wind_width).into(), 
+            0, 
+            wind_width.into(), 
+            scr_height.into()
+        ))
+    }
+
+    /// Updates all windows sizes and returns new window width
+    fn update_all_sizes(&mut self, delta: i16) 
+        -> Result<u16, Box<dyn std::error::Error>> {
+         let ctr = self.windows.len();
+
+        let scr_height = self.screen.height_in_pixels;
+        let scr_width = self.screen.width_in_pixels;
+    
+        let wind_width = if (ctr as i16 + delta) == 0 {
+            scr_width
+        } else {
+            scr_width / (ctr as i16 + delta) as u16
+        };
+        
+        for (i, wind) in self.windows.values_mut().enumerate() {
+            let new_x = i * wind_width as usize;
+            
+            self.conn.configure_window(
+                    wind.id,
+                    &ConfigureWindowAux::new()
+                        .x(new_x as i32)
+                        .y(wind.y as i32)
+                        .width(wind_width as u32)
+                        .height(scr_height as u32)
+            )?;
+
+            wind.x = new_x as u32;
+        }
+        
+        self.conn.flush()?;
+        Ok(wind_width)
     }
 }
 
