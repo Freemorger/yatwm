@@ -1,1 +1,3 @@
-- idk?
+- docs for config
+- actioncuts
+- maybe workspaces?

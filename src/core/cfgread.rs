@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 #[macro_use]
 use maplit;
+use x11rb::{connection::Connection, protocol::xproto::{ConnectionExt, Keycode}};
+use xkb::Keysym;
 
 use crate::core; 
 
@@ -14,7 +16,6 @@ const YATWM_DEF_CFGF: &str = ".config/yatwm/yat.toml"; // prepend home dir
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub general: General,
-    #[serde(rename = "shortcuts")]
     pub shortcuts: HashMap<String, String>, 
 } 
 
@@ -55,12 +56,50 @@ impl Config {
 
     fn def_general() -> General {
         General {
-            mainmod: "super".to_string()
+            mainmod: "super".to_string(),
+            sh: None,
         }
     }
 }  
 
+pub fn keysym_to_keycode<C: Connection>(conn: &C, target_sym: Keysym)
+    -> Option<Keycode> {
+    // TODO: optimize it, like caching or so
+    let setup = conn.setup();
+    let min = setup.min_keycode;
+    let max = setup.max_keycode;
+
+    let map = conn.get_keyboard_mapping(min, max - min - 1)
+        .ok()?.reply().ok()?;
+
+    for (i, syms) in map.keysyms.chunks(map.keysyms_per_keycode as usize)
+        .enumerate() {
+        if syms.iter().any(|&s| s == target_sym.0) {
+            return Some(min + i as u8)
+        }
+    }
+
+    None
+}
+
+pub fn keycode_to_keysym<C: Connection>(conn: &C, code: u8) 
+    -> Option<Keysym> {
+    let setup = conn.setup();
+    let min = setup.min_keycode;
+    let max = setup.max_keycode;
+
+    let map = conn.get_keyboard_mapping(min, max - min - 1)
+        .ok()?.reply().ok()?;
+
+    let idx = (code - min) as usize * map.keysyms_per_keycode as usize;
+    let keysym = map.keysyms[idx];
+    Some(xkb::Keysym(keysym))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct General {
-    mainmod: String, // main modifier key 
+    pub mainmod: String, // main modifier key
+    pub sh: Option<String>,
 }
+
+

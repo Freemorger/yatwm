@@ -1,12 +1,15 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use indexmap::IndexMap;
 use log::{error, info};
-use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, Screen, WindowClass}}, rust_connection::RustConnection};
+use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
-use crate::core::cfgread::Config;
+use crate::core::{
+    cfgread::{Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}
+};
 
 pub mod cfgread;
+pub mod input;
 
 const YATWM_DEF_LOGF: &str = ".local/state/yatwm.log"; // in homedir. prepend home 
 
@@ -28,9 +31,13 @@ impl WM {
         let (conn, scr_num) = x11rb::connect(None).unwrap();
         log::info!("Connected successful");
 
+        let mut state = YATState::new(conn, scr_num, cfg.general.sh.clone());
+        
+        state.reg_cuts(&cfg);
+
         WM {
             cfg: cfg,
-            state: YATState::new(conn, scr_num)
+            state: state
         }
     }
 
@@ -42,7 +49,7 @@ impl WM {
             ),
         )?;
 
-        self.state.conn.flush();
+        self.state.conn.flush()?;
         
         loop {
             let ev = self.state.conn.wait_for_event()?;
@@ -80,10 +87,11 @@ pub struct YATState<C: Connection> {
     windows: IndexMap<u32, YATWindow>,
     scr_num: usize,
     screen: Screen,
+    inpct: InputCt,
 }
 
 impl<C: Connection> YATState<C> {
-    pub fn new(conn: C, scr_num: usize) -> YATState<C> {
+    pub fn new(conn: C, scr_num: usize, shname: Option<String>) -> YATState<C> {
         let scr = conn.setup().roots[scr_num].clone();
 
         YATState { 
@@ -91,6 +99,7 @@ impl<C: Connection> YATState<C> {
             windows: IndexMap::new(),
             scr_num: scr_num,
             screen: scr,
+            inpct: InputCt::new(shname),
         }
     }
 
@@ -127,7 +136,17 @@ impl<C: Connection> YATState<C> {
             Event::UnmapNotify(e) => {
                 self.windows.remove(&e.window);
                 self.update_all_sizes(0)?; // already removed
-            }            
+            }
+            Event::KeyRelease(e) => {
+                info!("Key released: {:?}+{}", e.state, e.detail); 
+                let ks_opt = keycode_to_keysym(&self.conn, e.detail);
+                let mods: ModMask = ModMask::from(u16::from(e.state));
+           
+                if let Some(ks) = ks_opt {
+                    let cut = Keycut::new(ks.into(), mods);
+                    self.inpct.run_cut(cut);
+                }
+            }
             other => {
                 // TODO
             }
@@ -135,7 +154,101 @@ impl<C: Connection> YATState<C> {
         Ok(())
     }
 
+    /// Register shortcuts from config
+    fn reg_cuts(&mut self, cfg: &Config) {
+        let mainmod = match cfg.general.mainmod.to_lowercase().as_str() {
+            "super" => ModMask::M4,
+            "alt" => ModMask::M1,
+            "shift" => ModMask::SHIFT,
+            other => {
+                error!("Unknown mainmod {}", other);
+                return;
+            }
+        };
+
+        for (key, val) in &cfg.shortcuts {
+            let keys_iter = key.split('+');
+        
+            let mut modifiers = ModMask::default();
+            let mut mkey: Option<xkb::Keysym> = None;
+            let mut kcode: Option<u8> = None;
+            let mut success: bool = true;
+    
+            for kst in keys_iter {
+                match kst.to_lowercase().as_str() {
+                    "super" => {
+                        modifiers |= ModMask::M4;    
+                    }
+                    "alt" => {
+                        modifiers |= ModMask::M1;
+                    }
+                    "shift" => {
+                        modifiers |= ModMask::SHIFT;
+                    }
+                    "mod" => {
+                        modifiers |= mainmod;
+                    }
+                    other => {
+                        let sym = xkb::Keysym::from_str(other)
+                            .unwrap_or_else(|_| {
+                                error!("Unable to get keysym from {}", other);
+                                success = false;
+                                xkb::Keysym(0)
+                            });
+                        let keycode = keysym_to_keycode(&self.conn, sym)
+                            .unwrap_or_else(|| {
+                                error!("Unable to get keycode from \
+                                    keysym {} ({})", sym, other);
+                                success = false;
+                                0
+                            });            
+                        if !success {break;}
+
+                        mkey = Some(sym);
+                        kcode = Some(keycode);
+                    }
+                }
+            }
+
+            let keycode = match kcode {
+                Some(v) => v,
+                None => {
+                    error!("CFGPARSE: Can't get keycode");
+                    continue;
+                }
+            };
+
+            let sym = match mkey {
+                Some(v) => v,
+                None => {
+                    error!("CFGPARSE: shortcut must have a key");
+                    continue;
+                }
+            };
+
+            // TODO: maybe check result
+            let _ = self.conn.grab_key(
+                        true, 
+                        self.screen.root, 
+                        modifiers,
+                        keycode, 
+                        GrabMode::ASYNC, 
+                        GrabMode::ASYNC
+            );
+
+            let cut = Keycut::new(sym.into(), modifiers);
+
+            self.inpct.add_shortcut(
+                cut, 
+                input::CutTask::Command(val.to_owned())
+            );
+        }
+
+        let _ = self.conn.flush();
+    }
+    
     /// Calculate pos and size of new window (posx, posy, sizex, sizey)
+    /// Alg is straightforward: split in vertical bars basically
     fn calc_cords(&mut self, delta: i16) -> 
             Result<(u32, u32, u32, u32), Box<dyn std::error::Error>> { 
         let scr_height = self.screen.height_in_pixels;
@@ -213,4 +326,9 @@ pub fn get_homedpath(append: &str, cleanup: bool) -> Result<String, ()> {
     } else {
         Err(())
     }
+}
+
+#[derive(Debug)]
+struct CustomError {
+    message: String,
 }
