@@ -58,6 +58,7 @@ impl Config {
         General {
             mainmod: "super".to_string(),
             sh: None,
+            focus_new: Some(true),
         }
     }
 }  
@@ -100,6 +101,7 @@ pub fn keycode_to_keysym<C: Connection>(conn: &C, code: u8)
 pub struct General {
     pub mainmod: String, // main modifier key
     pub sh: Option<String>,
+    pub focus_new: Option<bool>,
 }
 
 

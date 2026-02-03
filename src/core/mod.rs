@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use indexmap::IndexMap;
 use log::{error, info};
-use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
+use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ButtonIndex, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, InputFocus, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
 use crate::core::{
     cfgread::{Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}
@@ -31,7 +31,7 @@ impl WM {
         let (conn, scr_num) = x11rb::connect(None).unwrap();
         log::info!("Connected successful");
 
-        let mut state = YATState::new(conn, scr_num, cfg.general.sh.clone());
+        let mut state = YATState::new(conn, scr_num, &cfg);
         
         state.reg_cuts(&cfg);
 
@@ -46,7 +46,20 @@ impl WM {
             self.state.screen.root,
             &ChangeWindowAttributesAux::new().event_mask(
                 EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY
+                | EventMask::ENTER_WINDOW
             ),
+        )?;
+
+        self.state.conn.grab_button(
+            true,               
+            self.state.screen.root,      
+            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE,
+            GrabMode::ASYNC,    
+            GrabMode::ASYNC,    
+            x11rb::NONE,        
+            x11rb::NONE,        
+            ButtonIndex::M1,    
+            ModMask::ANY,       
         )?;
 
         self.state.conn.flush()?;
@@ -88,10 +101,11 @@ pub struct YATState<C: Connection> {
     scr_num: usize,
     screen: Screen,
     inpct: InputCt,
+    focus_new: bool, 
 }
 
 impl<C: Connection> YATState<C> {
-    pub fn new(conn: C, scr_num: usize, shname: Option<String>) -> YATState<C> {
+    pub fn new(conn: C, scr_num: usize, cfg: &Config) -> YATState<C> {
         let scr = conn.setup().roots[scr_num].clone();
 
         YATState { 
@@ -99,7 +113,8 @@ impl<C: Connection> YATState<C> {
             windows: IndexMap::new(),
             scr_num: scr_num,
             screen: scr,
-            inpct: InputCt::new(shname),
+            inpct: InputCt::new(cfg.general.sh.clone()),
+            focus_new: cfg.general.focus_new.unwrap_or(true),
         }
     }
 
@@ -126,16 +141,36 @@ impl<C: Connection> YATState<C> {
                         .width(w)
                         .height(h)
                 )?;
+                self.windows.insert(e.window, new_win);
 
                 self.conn.map_window(e.window)?;
 
-                self.conn.flush()?;
+                // if the window is only one or focus_new, focus it
+                if self.windows.len() == 1 || self.focus_new {
+                    self.conn.set_input_focus(
+                        InputFocus::PARENT, 
+                        e.window, 
+                        x11rb::CURRENT_TIME
+                    )?;
+                }
 
-                self.windows.insert(e.window, new_win);
+                self.conn.flush()?;
             }
             Event::UnmapNotify(e) => {
                 self.windows.remove(&e.window);
-                self.update_all_sizes(0)?; // already removed
+                self.update_all_sizes(0)?; // already removed thus 0 
+
+                // if only one window left, focus it
+                if self.windows.len() == 1 && let Some(w) 
+                    = self.windows.get_index(0) {
+
+                    self.conn.set_input_focus(
+                        InputFocus::PARENT,
+                        w.1.id, 
+                        x11rb::CURRENT_TIME
+                    )?;
+                    self.conn.flush()?;
+                }
             }
             Event::KeyRelease(e) => {
                 info!("Key released: {:?}+{}", e.state, e.detail); 
@@ -147,6 +182,20 @@ impl<C: Connection> YATState<C> {
                     self.inpct.run_cut(cut);
                 }
             }
+            Event::ButtonPress(e) => {
+                // left mouse button 
+                if e.detail == 1 {
+                    let win_id = e.child;
+
+                    self.conn.set_input_focus(
+                        InputFocus::PARENT, 
+                        win_id,
+                        x11rb::CURRENT_TIME,
+                    )?;
+
+                    self.conn.flush()?;
+                } 
+            }
             other => {
                 // TODO
             }
@@ -157,9 +206,10 @@ impl<C: Connection> YATState<C> {
     /// Register shortcuts from config
     fn reg_cuts(&mut self, cfg: &Config) {
         let mainmod = match cfg.general.mainmod.to_lowercase().as_str() {
-            "super" => ModMask::M4,
+            "super" | "win" => ModMask::M4,
             "alt" => ModMask::M1,
             "shift" => ModMask::SHIFT,
+            "ctrl" | "control" => ModMask::CONTROL,
             other => {
                 error!("Unknown mainmod {}", other);
                 return;
@@ -176,7 +226,7 @@ impl<C: Connection> YATState<C> {
     
             for kst in keys_iter {
                 match kst.to_lowercase().as_str() {
-                    "super" => {
+                    "super" | "win" => {
                         modifiers |= ModMask::M4;    
                     }
                     "alt" => {
@@ -184,6 +234,9 @@ impl<C: Connection> YATState<C> {
                     }
                     "shift" => {
                         modifiers |= ModMask::SHIFT;
+                    }
+                    "ctrl" | "control" => {
+                        modifiers |= ModMask::CONTROL;
                     }
                     "mod" => {
                         modifiers |= mainmod;

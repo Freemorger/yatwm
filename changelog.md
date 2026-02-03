@@ -1,18 +1,7 @@
-v0.0.3:
-- shortcuts handling
-- parsing shortcuts from config, e.g.:
-```toml
-[general]
-mainmod = "super"
-
-[shortcuts]
-"mod+t" = "xterm"
-```
-- new config var in `general` table: `sh`. String, determines prefed shell.
-E.g.:
-```toml
-[general]
-...
-sh = "zsh"
-```
-- small code cleanse (need more though?)
+v0.0.4:
+- Control (`ctrl`/`control` in config) are now supported as modifier.    
+- `super` now may be called `win` in config.
+- update README.md
+- added `--version` cli arg that would print yatwm version and stop
+- focus windows on left mouse click
+- new field in `general` config table: `focus_new`
