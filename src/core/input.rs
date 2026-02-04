@@ -3,6 +3,8 @@ use std::{collections::HashMap, process::Command};
 use log::{error, info};
 use x11rb::protocol::xproto::{Keysym, ModMask};
 
+use crate::core::cfgread::ActionEnum;
+
 /// Input contoller struct
 #[derive(Debug)]
 pub struct InputCt {
@@ -22,7 +24,9 @@ impl InputCt {
         self.shortcuts.insert(cut, task);
     }
 
-    pub fn run_cut(&mut self, cut: Keycut) {
+    /// Runs shortcuts (if there one) and returns action enum if 
+    /// its needed to be done by YAT State 
+    pub fn run_cut(&mut self, cut: Keycut) -> Option<ActionEnum> {
         if let Some(task) = self.shortcuts.get(&cut) {
             match task {
                 CutTask::Command(cmd) => {
@@ -33,9 +37,13 @@ impl InputCt {
                         .spawn() {
                         error!("While running {}: {}", cmd, e);
                     };
-                    }
                 }
+                CutTask::Action(ac) => {
+                    return Some(ac.clone()); 
+                }
+            }
         };
+        None
     }
 }
 
@@ -57,4 +65,5 @@ impl Keycut {
 #[derive(Debug)]
 pub enum CutTask {
     Command(String),
+    Action(ActionEnum),
 }

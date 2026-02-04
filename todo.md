@@ -1,2 +1,2 @@
-- actioncuts
-- maybe workspaces?
+- workspaces: change, next, prev
+- update wiki for new conf

@@ -16,7 +16,7 @@ const YATWM_DEF_CFGF: &str = ".config/yatwm/yat.toml"; // prepend home dir
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub general: General,
-    pub shortcuts: HashMap<String, String>, 
+    pub shortcuts: HashMap<String, ActionEnum>,
 } 
 
 impl Config {
@@ -44,13 +44,13 @@ impl Config {
     fn def() -> Config {
         Config {
             general: Self::def_general(),
-            shortcuts: Self::def_shortcuts()
+            shortcuts: Self::def_shortcuts(),
         }
     }
 
-    fn def_shortcuts() -> HashMap<String, String> {
+    fn def_shortcuts() -> HashMap<String, ActionEnum> {
         hashmap! {
-            "t".to_string() => "xterm".to_string()
+            "t".to_string() => ActionEnum::Command("xterm".to_string())
         }    
     }
 
@@ -104,4 +104,10 @@ pub struct General {
     pub focus_new: Option<bool>,
 }
 
-
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionEnum {
+    Command(String),
+    SwitchWorkspace(usize), // TODO
+    DummyAction(usize),
+}

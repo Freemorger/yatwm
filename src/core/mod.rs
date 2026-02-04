@@ -1,11 +1,11 @@
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use indexmap::IndexMap;
-use log::{error, info};
+use log::{error, info, warn};
 use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ButtonIndex, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, InputFocus, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
 use crate::core::{
-    cfgread::{Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}
+    cfgread::{ActionEnum, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}
 };
 
 pub mod cfgread;
@@ -33,7 +33,7 @@ impl WM {
 
         let mut state = YATState::new(conn, scr_num, &cfg);
         
-        state.reg_cuts(&cfg);
+        state.reg_scuts(&cfg);
 
         WM {
             cfg: cfg,
@@ -179,7 +179,11 @@ impl<C: Connection> YATState<C> {
            
                 if let Some(ks) = ks_opt {
                     let cut = Keycut::new(ks.into(), mods);
-                    self.inpct.run_cut(cut);
+                    
+                    if let Some(ae) = self.inpct.run_cut(cut) {
+                        // execute action if it was actioncut 
+                        self.exec_action(&ae)?;
+                    };
                 }
             }
             Event::ButtonPress(e) => {
@@ -204,7 +208,7 @@ impl<C: Connection> YATState<C> {
     }
 
     /// Register shortcuts from config
-    fn reg_cuts(&mut self, cfg: &Config) {
+    fn reg_scuts(&mut self, cfg: &Config) {
         let mainmod = match cfg.general.mainmod.to_lowercase().as_str() {
             "super" | "win" => ModMask::M4,
             "alt" => ModMask::M1,
@@ -217,67 +221,19 @@ impl<C: Connection> YATState<C> {
         };
 
         for (key, val) in &cfg.shortcuts {
-            let keys_iter = key.split('+');
-        
-            let mut modifiers = ModMask::default();
-            let mut mkey: Option<xkb::Keysym> = None;
-            let mut kcode: Option<u8> = None;
-            let mut success: bool = true;
-    
-            for kst in keys_iter {
-                match kst.to_lowercase().as_str() {
-                    "super" | "win" => {
-                        modifiers |= ModMask::M4;    
-                    }
-                    "alt" => {
-                        modifiers |= ModMask::M1;
-                    }
-                    "shift" => {
-                        modifiers |= ModMask::SHIFT;
-                    }
-                    "ctrl" | "control" => {
-                        modifiers |= ModMask::CONTROL;
-                    }
-                    "mod" => {
-                        modifiers |= mainmod;
-                    }
-                    other => {
-                        let sym = xkb::Keysym::from_str(other)
-                            .unwrap_or_else(|_| {
-                                error!("Unable to get keysym from {}", other);
-                                success = false;
-                                xkb::Keysym(0)
-                            });
-                        let keycode = keysym_to_keycode(&self.conn, sym)
-                            .unwrap_or_else(|| {
-                                error!("Unable to get keycode from \
-                                    keysym {} ({})", sym, other);
-                                success = false;
-                                0
-                            });            
-                        if !success {break;}
+            let mut success = true;
 
-                        mkey = Some(sym);
-                        kcode = Some(keycode);
-                    }
-                }
-            }
-
-            let keycode = match kcode {
-                Some(v) => v,
-                None => {
-                    error!("CFGPARSE: Can't get keycode");
-                    continue;
-                }
-            };
-
-            let sym = match mkey {
-                Some(v) => v,
-                None => {
-                    error!("CFGPARSE: shortcut must have a key");
-                    continue;
-                }
-            };
+            let (sym, keycode, modifiers) = 
+                Self::parse_keyscomb(
+                    key, 
+                    mainmod, 
+                    &self.conn
+                ).unwrap_or_else(|| {
+                    error!("Failed to parse shortcut {}", key);
+                    success = false;
+                    (xkb::Keysym(0), 0, ModMask::default())
+                });
+            if !success {continue;}
 
             // TODO: maybe check result
             let _ = self.conn.grab_key(
@@ -291,13 +247,100 @@ impl<C: Connection> YATState<C> {
 
             let cut = Keycut::new(sym.into(), modifiers);
 
+            let task = match val {
+                ActionEnum::Command(c) => input::CutTask::Command(c.clone()),
+                other => input::CutTask::Action(other.clone())
+            };
+
             self.inpct.add_shortcut(
                 cut, 
-                input::CutTask::Command(val.to_owned())
+                task
             );
         }
 
         let _ = self.conn.flush();
+    }
+
+    /// Parses key combination and returns keysym, keycode  and modmask 
+    fn parse_keyscomb(key: &str, mainmod: ModMask, conn: &C) 
+        -> Option<(xkb::Keysym, u8, ModMask)> {
+        let keys_iter = key.split('+');
+    
+        let mut modifiers = ModMask::default();
+        let mut mkey: Option<xkb::Keysym> = None;
+        let mut kcode: Option<u8> = None;
+        let mut success: bool = true;
+
+        for kst in keys_iter {
+            match kst.to_lowercase().as_str() {
+                "super" | "win" => {
+                    modifiers |= ModMask::M4;    
+                }
+                "alt" => {
+                    modifiers |= ModMask::M1;
+                }
+                "shift" => {
+                    modifiers |= ModMask::SHIFT;
+                }
+                "ctrl" | "control" => {
+                    modifiers |= ModMask::CONTROL;
+                }
+                "mod" => {
+                    modifiers |= mainmod;
+                }
+                other => {
+                    let sym = xkb::Keysym::from_str(other)
+                        .unwrap_or_else(|_| {
+                            error!("Unable to get keysym from {}", other);
+                            success = false;
+                            xkb::Keysym(0)
+                        });
+                    let keycode = keysym_to_keycode(&conn, sym)
+                        .unwrap_or_else(|| {
+                            error!("Unable to get keycode from \
+                                keysym {} ({})", sym, other);
+                            success = false;
+                            0
+                        });            
+                    if !success {break;}
+
+                    mkey = Some(sym);
+                    kcode = Some(keycode);
+                }
+            }
+        }
+
+        let keycode = match kcode {
+            Some(v) => v,
+            None => {
+                error!("CFGPARSE: Can't get keycode");
+                return None;
+            }
+        };
+
+        let sym = match mkey {
+            Some(v) => v,
+            None => {
+                error!("CFGPARSE: shortcut must have a key");
+                return None;
+            }
+        };
+        Some((sym, keycode, modifiers))
+    }
+
+    fn exec_action(&mut self, action: &ActionEnum) 
+        -> Result<(), Box<dyn std::error::Error>> {
+        
+        match action {
+            ActionEnum::DummyAction(v) => {
+                warn!("Dummy action made: {}", v);
+            }
+            other => {
+                warn!("TODO: {:?}", other);
+            }
+        }
+        
+        Ok(())
     }
     
     /// Calculate pos and size of new window (posx, posy, sizex, sizey)
