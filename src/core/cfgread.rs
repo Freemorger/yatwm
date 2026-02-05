@@ -108,6 +108,6 @@ pub struct General {
 #[serde(rename_all = "snake_case")]
 pub enum ActionEnum {
     Command(String),
-    SwitchWorkspace(usize), // TODO
-    DummyAction(usize),
+    SwitchWorkspace(usize), 
+    DeltaWorkspace(isize),
 }

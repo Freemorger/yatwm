@@ -2,14 +2,16 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use indexmap::IndexMap;
 use log::{error, info, warn};
+use maplit::hashmap;
 use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ButtonIndex, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, InputFocus, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
 use crate::core::{
-    cfgread::{ActionEnum, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}
+    cfgread::{ActionEnum, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}, workspaces::Workspace
 };
 
 pub mod cfgread;
 pub mod input;
+pub mod workspaces;
 
 const YATWM_DEF_LOGF: &str = ".local/state/yatwm.log"; // in homedir. prepend home 
 
@@ -97,8 +99,8 @@ impl WM {
 
 pub struct YATState<C: Connection> {
     conn: C,
-    windows: IndexMap<u32, YATWindow>,
-    scr_num: usize,
+    workspaces: HashMap<usize, Workspace>,
+    cur_scr: usize, // index of cur workspace 
     screen: Screen,
     inpct: InputCt,
     focus_new: bool, 
@@ -110,11 +112,11 @@ impl<C: Connection> YATState<C> {
 
         YATState { 
             conn: conn, 
-            windows: IndexMap::new(),
-            scr_num: scr_num,
+            cur_scr: 1,
             screen: scr,
             inpct: InputCt::new(cfg.general.sh.clone()),
             focus_new: cfg.general.focus_new.unwrap_or(true),
+            workspaces: hashmap! {1 => Workspace::new(1)},
         }
     }
 
@@ -128,10 +130,19 @@ impl<C: Connection> YATState<C> {
                 self.conn.flush()?;
             }
             Event::MapRequest(e) => {
-                let (x, y, w, h) = self.calc_cords(1)?;
                 let new_win = YATWindow::new(
-                    e.window, x, y
+                    e.window, 0, 0 // would be updated anyways
                 );
+
+                let cur_wrksp = self.workspaces
+                    .get_mut(&self.cur_scr).ok_or(CustomError {
+                        message: "Can't get cur workspace".to_owned()
+                     })?;
+                cur_wrksp.add_wind(e.window, new_win);
+                let cur_wrksp_len = cur_wrksp.windows.len();
+
+                let (x, y, w, h) = self.calc_cords(0)?;
+                
                 
                 self.conn.configure_window(
                     e.window,
@@ -141,12 +152,12 @@ impl<C: Connection> YATState<C> {
                         .width(w)
                         .height(h)
                 )?;
-                self.windows.insert(e.window, new_win);
+                
 
                 self.conn.map_window(e.window)?;
 
                 // if the window is only one or focus_new, focus it
-                if self.windows.len() == 1 || self.focus_new {
+                if cur_wrksp_len == 1 || self.focus_new {
                     self.conn.set_input_focus(
                         InputFocus::PARENT, 
                         e.window, 
@@ -156,13 +167,18 @@ impl<C: Connection> YATState<C> {
 
                 self.conn.flush()?;
             }
-            Event::UnmapNotify(e) => {
-                self.windows.remove(&e.window);
+            Event::DestroyNotify(e) => {
+                self.rm_any_wind(e.window);
                 self.update_all_sizes(0)?; // already removed thus 0 
 
+                let cur_wrksp = self.workspaces
+                    .get_mut(&self.cur_scr).ok_or(CustomError {
+                    message: "Can't get cur workspace".to_owned()
+                 })?;
+
                 // if only one window left, focus it
-                if self.windows.len() == 1 && let Some(w) 
-                    = self.windows.get_index(0) {
+                if cur_wrksp.windows.len() == 1 && let Some(w) 
+                =  cur_wrksp.windows.get_index(0) {
 
                     self.conn.set_input_focus(
                         InputFocus::PARENT,
@@ -204,6 +220,49 @@ impl<C: Connection> YATState<C> {
                 // TODO
             }
         }
+        Ok(())
+    }
+
+    fn rm_any_wind(&mut self, idx: u32) -> Option<YATWindow> {
+        // TODO
+        for (i, wrksp) in self.workspaces.iter_mut() {
+            if let Some(v) = wrksp.rm_wind(idx as u32) {
+                return Some(v);
+            }; 
+        }
+        None
+    }
+
+    fn change_workspace(&mut self, new_id: usize) 
+        -> Result<(), Box<dyn std::error::Error>> {
+        
+
+        let cur_wrksp = self.workspaces.get(&self.cur_scr).ok_or(CustomError {
+            message: "Failed to get cur workspace".to_owned()
+        })?;
+
+        for (i, wind) in &cur_wrksp.windows {
+            self.conn.unmap_window(wind.id)?;
+        }
+        
+        match self.workspaces.get(&new_id) {
+            Some(v) => {
+                info!("found workpace {}, win len: {}", new_id, v.windows.len());
+                for (i, wind) in &v.windows {
+                    self.conn.map_window(wind.id)?;
+                    info!("mapping wind {}", wind.id);
+                }
+            }
+            None => {
+                let wrksp = Workspace::new(new_id);
+                self.workspaces.insert(new_id, wrksp);
+                warn!("creating new workspace");
+            }
+        };
+
+        self.cur_scr = new_id;
+        self.conn.flush()?;
+
         Ok(())
     }
 
@@ -332,8 +391,21 @@ impl<C: Connection> YATState<C> {
         -> Result<(), Box<dyn std::error::Error>> {
         
         match action {
-            ActionEnum::DummyAction(v) => {
-                warn!("Dummy action made: {}", v);
+            ActionEnum::SwitchWorkspace(id) => {
+                self.change_workspace(*id)?;
+            }
+            ActionEnum::DeltaWorkspace(delta) => {
+                info!("delta: {}, cur scr: {}", delta, self.cur_scr);
+
+                let new_id = self.cur_scr.saturating_add_signed(*delta);
+
+                if self.workspaces.get(&new_id).is_none() {
+                    return Err(Box::new(CustomError {
+                        message: format!("No workspace {}", new_id)
+                    }));
+                }
+
+                self.change_workspace(new_id)?;
             }
             other => {
                 warn!("TODO: {:?}", other);
@@ -360,10 +432,16 @@ impl<C: Connection> YATState<C> {
         ))
     }
 
-    /// Updates all windows sizes and returns new window width
+    /// Updates all windows sizes and returns new window width except `except`
     fn update_all_sizes(&mut self, delta: i16) 
         -> Result<u16, Box<dyn std::error::Error>> {
-         let ctr = self.windows.len();
+        let cur_wrksp = self.workspaces
+            .get_mut(&self.cur_scr)
+            .ok_or(CustomError {
+                message: "Can't get cur workspace".to_owned()}
+            )?;
+        let ctr = cur_wrksp.windows.len();
+         // TODO
 
         let scr_height = self.screen.height_in_pixels;
         let scr_width = self.screen.width_in_pixels;
@@ -374,7 +452,7 @@ impl<C: Connection> YATState<C> {
             scr_width / (ctr as i16 + delta) as u16
         };
         
-        for (i, wind) in self.windows.values_mut().enumerate() {
+        for (i, wind) in cur_wrksp.windows.values_mut().enumerate() {
             let new_x = i * wind_width as usize;
             
             self.conn.configure_window(
@@ -394,6 +472,7 @@ impl<C: Connection> YATState<C> {
     }
 }
 
+#[derive(Debug)]
 pub struct YATWindow {
     pub id: u32,
     pub x: u32,
@@ -427,4 +506,13 @@ pub fn get_homedpath(append: &str, cleanup: bool) -> Result<String, ()> {
 #[derive(Debug)]
 struct CustomError {
     message: String,
+}
+
+impl std::fmt::Display for CustomError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CustomError {
 }

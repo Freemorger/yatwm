@@ -1,2 +1,2 @@
-- workspaces: change, next, prev
-- update wiki for new conf
+- config reload shortcut?
+- yatstatus?
