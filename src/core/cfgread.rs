@@ -59,6 +59,7 @@ impl Config {
             mainmod: "super".to_string(),
             sh: None,
             focus_new: Some(true),
+            def_wrksp_ctr: None,
         }
     }
 }  
@@ -102,6 +103,7 @@ pub struct General {
     pub mainmod: String, // main modifier key
     pub sh: Option<String>,
     pub focus_new: Option<bool>,
+    pub def_wrksp_ctr: Option<usize>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -110,4 +112,7 @@ pub enum ActionEnum {
     Command(String),
     SwitchWorkspace(usize), 
     DeltaWorkspace(isize),
+    MoveToWorkspace(usize),
+    Complex(Vec<ActionEnum>),
+    CfgReload(usize),
 }

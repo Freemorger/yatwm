@@ -1,2 +1,1 @@
-- config reload shortcut?
 - yatstatus?

@@ -109,6 +109,13 @@ pub struct YATState<C: Connection> {
 impl<C: Connection> YATState<C> {
     pub fn new(conn: C, scr_num: usize, cfg: &Config) -> YATState<C> {
         let scr = conn.setup().roots[scr_num].clone();
+        
+        let mut workspaces = HashMap::new();
+        let wrksps_ct = cfg.general.def_wrksp_ctr.unwrap_or(1);
+        for i in 1..(wrksps_ct + 1) { 
+            let workspace = Workspace::new(i);
+            workspaces.insert(i, workspace);
+        }
 
         YATState { 
             conn: conn, 
@@ -116,7 +123,7 @@ impl<C: Connection> YATState<C> {
             screen: scr,
             inpct: InputCt::new(cfg.general.sh.clone()),
             focus_new: cfg.general.focus_new.unwrap_or(true),
-            workspaces: hashmap! {1 => Workspace::new(1)},
+            workspaces: workspaces,
         }
     }
 
@@ -236,7 +243,6 @@ impl<C: Connection> YATState<C> {
     fn change_workspace(&mut self, new_id: usize) 
         -> Result<(), Box<dyn std::error::Error>> {
         
-
         let cur_wrksp = self.workspaces.get(&self.cur_scr).ok_or(CustomError {
             message: "Failed to get cur workspace".to_owned()
         })?;
@@ -250,6 +256,13 @@ impl<C: Connection> YATState<C> {
                 info!("found workpace {}, win len: {}", new_id, v.windows.len());
                 for (i, wind) in &v.windows {
                     self.conn.map_window(wind.id)?;
+                    if v.windows.len() == 1 {
+                        self.conn.set_input_focus(
+                            InputFocus::PARENT,
+                            wind.id,
+                            x11rb::CURRENT_TIME
+                        )?;
+                    }
                     info!("mapping wind {}", wind.id);
                 }
             }
@@ -261,6 +274,7 @@ impl<C: Connection> YATState<C> {
         };
 
         self.cur_scr = new_id;
+        self.update_all_sizes(0)?;
         self.conn.flush()?;
 
         Ok(())
@@ -395,8 +409,6 @@ impl<C: Connection> YATState<C> {
                 self.change_workspace(*id)?;
             }
             ActionEnum::DeltaWorkspace(delta) => {
-                info!("delta: {}, cur scr: {}", delta, self.cur_scr);
-
                 let new_id = self.cur_scr.saturating_add_signed(*delta);
 
                 if self.workspaces.get(&new_id).is_none() {
@@ -406,6 +418,55 @@ impl<C: Connection> YATState<C> {
                 }
 
                 self.change_workspace(new_id)?;
+            }
+            ActionEnum::MoveToWorkspace(new_id) => {
+                let focused_id = self.conn.get_input_focus()?
+                    .reply()?
+                    .focus;
+                info!("moving wind {} to {}-th workspace, cur: {}",
+                    focused_id, new_id, self.cur_scr);
+
+                // lets check if there is a new workspace 
+                // so we dont just remove window in case of some trouble
+                self.workspaces 
+                    .get(new_id)
+                    .ok_or(CustomError {
+                        message: format!("Can't get current ({}) workspace",
+                                     self.cur_scr)
+                    })?;
+
+                
+                let cur_wrksp = self.workspaces
+                    .get_mut(&self.cur_scr)
+                    .ok_or(CustomError {
+                        message: format!("Can't get current ({}) workspace",
+                                     self.cur_scr)
+                    })?;
+                let removed = cur_wrksp.windows.shift_remove(&focused_id)
+                    .ok_or(CustomError {
+                    message: format!("Seems like window {} isn't in \
+                                 current workspace!", focused_id) 
+                })?;
+                
+                let new_worksp = self.workspaces 
+                    .get_mut(new_id)
+                    .ok_or(CustomError {
+                        message: format!("Can't get current ({}) workspace",
+                                     self.cur_scr)
+                    })?;
+                self.conn.unmap_window(removed.id)?;
+
+                new_worksp.windows.insert(focused_id, removed);
+
+                self.update_all_sizes(0)?;
+            }
+            ActionEnum::CfgReload(_) => {
+                self.reload_cfg()?;
+            }
+            ActionEnum::Complex(v) => {
+                for act in v {
+                    self.exec_action(act)?;
+                }
             }
             other => {
                 warn!("TODO: {:?}", other);
@@ -441,7 +502,6 @@ impl<C: Connection> YATState<C> {
                 message: "Can't get cur workspace".to_owned()}
             )?;
         let ctr = cur_wrksp.windows.len();
-         // TODO
 
         let scr_height = self.screen.height_in_pixels;
         let scr_width = self.screen.width_in_pixels;
@@ -469,6 +529,27 @@ impl<C: Connection> YATState<C> {
         
         self.conn.flush()?;
         Ok(wind_width)
+    }
+
+    fn reload_cfg(&mut self) -> 
+        Result<(), Box<dyn std::error::Error>> {
+
+        let new_cfg = Config::from_def_dir();
+        self.focus_new = new_cfg.general.focus_new.unwrap_or(true);
+        self.inpct.shell = new_cfg.general.sh
+            .clone()
+            .unwrap_or("sh".to_owned());
+
+        self.conn.ungrab_key(
+            0, // any key  
+            self.screen.root, 
+            ModMask::ANY
+        )?;
+
+        self.reg_scuts(&new_cfg);
+        self.conn.flush()?;
+        
+        Ok(())
     }
 }
 

@@ -9,7 +9,7 @@ use crate::core::cfgread::ActionEnum;
 #[derive(Debug)]
 pub struct InputCt {
     shortcuts: HashMap<Keycut, CutTask>, 
-    shell: String, // shell command (e.g. sh/bash/zsh)
+    pub shell: String, // shell command (e.g. sh/bash/zsh)
 }
 
 impl InputCt {
