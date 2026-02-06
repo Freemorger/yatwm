@@ -30,13 +30,7 @@ impl InputCt {
         if let Some(task) = self.shortcuts.get(&cut) {
             match task {
                 CutTask::Command(cmd) => {
-                    info!("Running command {}", cmd);
-                    if let Err(e) = Command::new(&self.shell)
-                        .arg("-c")
-                        .arg(cmd)
-                        .spawn() {
-                        error!("While running {}: {}", cmd, e);
-                    };
+                    self.run_cmd(&cmd.clone()); 
                 }
                 CutTask::Action(ac) => {
                     return Some(ac.clone()); 
@@ -45,7 +39,18 @@ impl InputCt {
         };
         None
     }
+
+    pub fn run_cmd(&mut self, cmd: &str) {
+        info!("Running command {}", cmd);
+        if let Err(e) = Command::new(&self.shell)
+            .arg("-c")
+            .arg(cmd)
+            .spawn() {
+            error!("While running {}: {}", cmd, e);
+        };
+    }
 }
+
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Keycut {

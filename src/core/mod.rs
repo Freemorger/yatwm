@@ -6,7 +6,7 @@ use maplit::hashmap;
 use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ButtonIndex, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, InputFocus, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
 use crate::core::{
-    cfgread::{ActionEnum, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}, workspaces::Workspace
+    cfgread::{ActionEnum, CfgMacro, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}, workspaces::Workspace
 };
 
 pub mod cfgread;
@@ -65,6 +65,12 @@ impl WM {
         )?;
 
         self.state.conn.flush()?;
+
+        if let Some(sv) = self.cfg.general.autostart.as_ref() {
+            for cmd in sv {
+                self.state.inpct.run_cmd(&cmd); 
+            }
+        };
         
         loop {
             let ev = self.state.conn.wait_for_event()?;
@@ -104,6 +110,7 @@ pub struct YATState<C: Connection> {
     screen: Screen,
     inpct: InputCt,
     focus_new: bool, 
+    macros: HashMap<String, CfgMacro>,
 }
 
 impl<C: Connection> YATState<C> {
@@ -124,6 +131,7 @@ impl<C: Connection> YATState<C> {
             inpct: InputCt::new(cfg.general.sh.clone()),
             focus_new: cfg.general.focus_new.unwrap_or(true),
             workspaces: workspaces,
+            macros: cfg.macros.clone().unwrap_or(HashMap::new()),
         }
     }
 
@@ -231,7 +239,6 @@ impl<C: Connection> YATState<C> {
     }
 
     fn rm_any_wind(&mut self, idx: u32) -> Option<YATWindow> {
-        // TODO
         for (i, wrksp) in self.workspaces.iter_mut() {
             if let Some(v) = wrksp.rm_wind(idx as u32) {
                 return Some(v);
@@ -297,10 +304,9 @@ impl<C: Connection> YATState<C> {
             let mut success = true;
 
             let (sym, keycode, modifiers) = 
-                Self::parse_keyscomb(
+                self.parse_keyscomb(
                     key, 
-                    mainmod, 
-                    &self.conn
+                    mainmod 
                 ).unwrap_or_else(|| {
                     error!("Failed to parse shortcut {}", key);
                     success = false;
@@ -334,10 +340,41 @@ impl<C: Connection> YATState<C> {
         let _ = self.conn.flush();
     }
 
+    /// Attempts to expand `Define` macro
+    fn try_macroexp(&mut self, name: &str) -> Option<String> {
+        if let Some(CfgMacro::Define(expanded)) = self.macros.get(name) {
+            return Some(expanded.clone());
+        } else {
+            return None;
+        }
+    }
+
     /// Parses key combination and returns keysym, keycode  and modmask 
-    fn parse_keyscomb(key: &str, mainmod: ModMask, conn: &C) 
+    fn parse_keyscomb(&mut self, key: &str, mainmod: ModMask) 
         -> Option<(xkb::Keysym, u8, ModMask)> {
-        let keys_iter = key.split('+');
+        let mut preproced = String::new();
+        for k in key.split('+') {
+            if k.starts_with('{') {
+                let cleaned = k
+                        .replace("{", "")
+                        .replace("}", "");
+
+                let mut err = false;
+                let exp = self.try_macroexp(&cleaned).unwrap_or_else(|| {
+                    error!("Unknown macro {}", cleaned);
+                    err = true;
+                    k.to_owned()
+                });
+                if err {return None;}
+
+                preproced += &format!("{}+", exp);
+            } else {
+                preproced += &format!("{}+", k);
+            }
+        }
+        if preproced.ends_with("+") {preproced.pop();}
+
+        let keys_iter = preproced.split('+');
     
         let mut modifiers = ModMask::default();
         let mut mkey: Option<xkb::Keysym> = None;
@@ -345,6 +382,19 @@ impl<C: Connection> YATState<C> {
         let mut success: bool = true;
 
         for kst in keys_iter {
+            // let kst_e = if kst.starts_with('{') {
+            //     let cleaned = kst
+            //         .replace("{", "")
+            //         .replace("}", "");
+            //
+            //     self.try_macroexp(&cleaned).unwrap_or_else(|| {
+            //         error!("Unknown macro {}", cleaned);
+            //         kst.to_owned()
+            //     })
+            // } else {
+            //     kst.to_owned()
+            // };
+
             match kst.to_lowercase().as_str() {
                 "super" | "win" => {
                     modifiers |= ModMask::M4;    
@@ -368,7 +418,7 @@ impl<C: Connection> YATState<C> {
                             success = false;
                             xkb::Keysym(0)
                         });
-                    let keycode = keysym_to_keycode(&conn, sym)
+                    let keycode = keysym_to_keycode(&self.conn, sym)
                         .unwrap_or_else(|| {
                             error!("Unable to get keycode from \
                                 keysym {} ({})", sym, other);
@@ -460,8 +510,66 @@ impl<C: Connection> YATState<C> {
 
                 self.update_all_sizes(0)?;
             }
+            ActionEnum::FocusOther(delta) => {
+                let focus_id = self.conn.get_input_focus()?
+                    .reply()?
+                    .focus;
+
+                let cur_wrksp = self.workspaces.get(&self.cur_scr)
+                    .ok_or(CustomError {
+                        message: format!("Can't get cur workspace {}",
+                                     self.cur_scr)
+                    })?;
+
+                let idx = cur_wrksp.windows.get_index_of(&focus_id)
+                    .ok_or(CustomError {
+                        message: format!("Can't get window {} in cur workspace",
+                                     focus_id)
+                    })?;
+
+                let new_id = idx.saturating_add_signed(*delta);
+
+                let mut flag = false;
+                let placehold = YATWindow::new(0,0,0);
+
+                let new_focus = cur_wrksp.windows.get_index(new_id)
+                    .unwrap_or_else(|| {
+                        warn!("Trying to switch to non-existent {}-th window",
+                            new_id);
+                        flag = true;
+                        (&0, &placehold)
+                    });
+                if flag {return Ok(());} // avoiding errors spam
+
+                self.conn.set_input_focus(
+                    InputFocus::PARENT, 
+                    *new_focus.0,
+                    x11rb::CURRENT_TIME
+                )?;
+
+                self.conn.flush()?;
+            }
             ActionEnum::CfgReload(_) => {
                 self.reload_cfg()?;
+            }
+            ActionEnum::ExpandMacro(name) => {
+                // TODO: parametrized macros
+                // TODO: remove clone here for better perf 
+                let macros = self.macros.get(name).ok_or(CustomError {
+                    message: format!("Can't get macro {}", name)
+                })?.clone();
+
+                match macros {
+                    CfgMacro::DefineActions(v) => {
+                        for act in v.iter() {
+                            self.exec_action(act)?;
+                        }
+                    }
+                    other => {
+                        error!("Unimplemnted macro expand {:?}", other);
+                    }
+                } 
+
             }
             ActionEnum::Complex(v) => {
                 for act in v {
@@ -539,6 +647,14 @@ impl<C: Connection> YATState<C> {
         self.inpct.shell = new_cfg.general.sh
             .clone()
             .unwrap_or("sh".to_owned());
+
+        self.macros.clear();
+        self.macros.extend(
+            new_cfg.macros
+                .clone()
+                .unwrap_or(HashMap::new())
+                .into_iter()
+        );
 
         self.conn.ungrab_key(
             0, // any key  

@@ -17,6 +17,7 @@ const YATWM_DEF_CFGF: &str = ".config/yatwm/yat.toml"; // prepend home dir
 pub struct Config {
     pub general: General,
     pub shortcuts: HashMap<String, ActionEnum>,
+    pub macros: Option<HashMap<String, CfgMacro>>,
 } 
 
 impl Config {
@@ -45,12 +46,14 @@ impl Config {
         Config {
             general: Self::def_general(),
             shortcuts: Self::def_shortcuts(),
+            macros: None,
         }
     }
 
     fn def_shortcuts() -> HashMap<String, ActionEnum> {
         hashmap! {
-            "t".to_string() => ActionEnum::Command("xterm".to_string())
+            "t".to_string() => ActionEnum::Command("xterm".to_string()),
+            "super+alt+r".to_string() => ActionEnum::CfgReload(0),
         }    
     }
 
@@ -60,6 +63,7 @@ impl Config {
             sh: None,
             focus_new: Some(true),
             def_wrksp_ctr: None,
+            autostart: None,
         }
     }
 }  
@@ -104,6 +108,7 @@ pub struct General {
     pub sh: Option<String>,
     pub focus_new: Option<bool>,
     pub def_wrksp_ctr: Option<usize>,
+    pub autostart: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -115,4 +120,13 @@ pub enum ActionEnum {
     MoveToWorkspace(usize),
     Complex(Vec<ActionEnum>),
     CfgReload(usize),
+    FocusOther(isize),
+    ExpandMacro(String), // macro name
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum CfgMacro {
+    Define(String), // like in C
+    DefineActions(Vec<ActionEnum>),
 }
