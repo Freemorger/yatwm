@@ -9,7 +9,7 @@ use maplit;
 use x11rb::{connection::Connection, protocol::xproto::{ConnectionExt, Keycode}};
 use xkb::Keysym;
 
-use crate::core; 
+use crate::core::{self, CustomError}; 
 
 const YATWM_DEF_CFGF: &str = ".config/yatwm/yat.toml"; // prepend home dir
 
@@ -121,7 +121,34 @@ pub enum ActionEnum {
     Complex(Vec<ActionEnum>),
     CfgReload(usize),
     FocusOther(isize),
-    ExpandMacro(String), // macro name
+    ExpandMacro(String, ActionValue), // macro name
+}
+
+impl ActionEnum {
+    pub fn replace_val(&self, new_val: &ActionValue) 
+        -> Result<ActionEnum, Box<dyn std::error::Error>> {
+        match (self.clone(), new_val.clone()) {
+            (ActionEnum::Command(_), ActionValue::Str(s)) => {
+                Ok(ActionEnum::Command(s.clone()))
+            }
+            (ActionEnum::FocusOther(_), ActionValue::Int(i)) => {
+                Ok(ActionEnum::FocusOther(i))
+            }
+            (ActionEnum::MoveToWorkspace(_), ActionValue::Uint(u)) => {
+                Ok(ActionEnum::MoveToWorkspace(u))
+            }
+            (ActionEnum::DeltaWorkspace(_), ActionValue::Int(i)) => {
+                Ok(ActionEnum::DeltaWorkspace(i))
+            }
+            (ActionEnum::SwitchWorkspace(_), ActionValue::Uint(u)) => {
+                Ok(ActionEnum::SwitchWorkspace(u))
+            }
+            other => Err(Box::new(CustomError {
+                message: format!("{:?} couldn't be replaced with {:?}",
+                             other.0, other.1)
+            }))
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -129,4 +156,16 @@ pub enum ActionEnum {
 pub enum CfgMacro {
     Define(String), // like in C
     DefineActions(Vec<ActionEnum>),
+    ReplaceAll(Vec<ActionEnum>, ActionValue),
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionValue {
+    Uint(usize),
+    Int(isize),
+    Str(String),
+    ActVec(Vec<ActionEnum>),
+    GetFromCut, // gets key
+    None,
 }

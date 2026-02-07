@@ -54,15 +54,18 @@ impl InputCt {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Keycut {
-    ksym: Keysym,
+    ksym: Option<Keysym>,
     modmask: ModMask,
+    ranges: KeyRange,
 }
 
 impl Keycut {
-    pub fn new(sym: Keysym, modifiers: ModMask) -> Keycut {
+    pub fn new(sym: Option<Keysym>, modifiers: ModMask, rang: KeyRange) 
+        -> Keycut {
         Keycut { 
             ksym: sym, 
             modmask: modifiers,
+            ranges: rang
         }
     }
 }
@@ -71,4 +74,11 @@ impl Keycut {
 pub enum CutTask {
     Command(String),
     Action(ActionEnum),
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum KeyRange {
+    Numbers,
+    Any,
+    None,
 }

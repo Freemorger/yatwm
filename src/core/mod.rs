@@ -6,7 +6,7 @@ use maplit::hashmap;
 use x11rb::{COPY_DEPTH_FROM_PARENT, connection::Connection, protocol::{Event, xproto::{ButtonIndex, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, GrabMode, InputFocus, ModMask, Screen, WindowClass}}, rust_connection::RustConnection};
 
 use crate::core::{
-    cfgread::{ActionEnum, CfgMacro, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, Keycut}, workspaces::Workspace
+    cfgread::{ActionEnum, ActionValue, CfgMacro, Config, keycode_to_keysym, keysym_to_keycode}, input::{InputCt, KeyRange, Keycut}, workspaces::Workspace
 };
 
 pub mod cfgread;
@@ -159,6 +159,7 @@ impl<C: Connection> YATState<C> {
                 let (x, y, w, h) = self.calc_cords(0)?;
                 
                 
+
                 self.conn.configure_window(
                     e.window,
                     &ConfigureWindowAux::new()
@@ -167,7 +168,22 @@ impl<C: Connection> YATState<C> {
                         .width(w)
                         .height(h)
                 )?;
-                
+
+                let event_mask = EventMask::EXPOSURE
+                    | EventMask::STRUCTURE_NOTIFY
+                    | EventMask::PROPERTY_CHANGE
+                    | EventMask::BUTTON_PRESS    
+                    | EventMask::BUTTON_RELEASE  
+                    | EventMask::POINTER_MOTION  
+                    | EventMask::ENTER_WINDOW   
+                    | EventMask::LEAVE_WINDOW
+                    | EventMask::FOCUS_CHANGE;   
+
+                self.conn.change_window_attributes(
+                    e.window,
+                    &ChangeWindowAttributesAux::default()
+                        .event_mask(event_mask)
+                )?;
 
                 self.conn.map_window(e.window)?;
 
@@ -204,17 +220,33 @@ impl<C: Connection> YATState<C> {
                 }
             }
             Event::KeyRelease(e) => {
-                info!("Key released: {:?}+{}", e.state, e.detail); 
                 let ks_opt = keycode_to_keysym(&self.conn, e.detail);
                 let mods: ModMask = ModMask::from(u16::from(e.state));
            
                 if let Some(ks) = ks_opt {
-                    let cut = Keycut::new(ks.into(), mods);
-                    
+                    info!("Key released: {:?}+{} ({})", e.state, e.detail, 
+                        ks.utf8());
+                    let cut = Keycut::new(Some(ks.into()), mods, KeyRange::None);
+
                     if let Some(ae) = self.inpct.run_cut(cut) {
-                        // execute action if it was actioncut 
-                        self.exec_action(&ae)?;
-                    };
+                        self.exec_action(&ae, &ks.utf8())?;
+                    } else {
+                        if let Some(digit) = ks.utf8().parse::<u8>().ok() {
+                            if (1..=9).contains(&digit) {
+                                let num_cut = Keycut::new(None, mods,
+                                    KeyRange::Numbers);
+                                if let Some(ae) = self.inpct.run_cut(num_cut) {
+                                    self.exec_action(&ae, &ks.utf8())?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        
+                        let any_cut = Keycut::new(None, mods, KeyRange::Any);
+                        if let Some(ae) = self.inpct.run_cut(any_cut) {
+                            self.exec_action(&ae, &ks.utf8())?;
+                        } 
+                    }
                 }
             }
             Event::ButtonPress(e) => {
@@ -303,28 +335,90 @@ impl<C: Connection> YATState<C> {
         for (key, val) in &cfg.shortcuts {
             let mut success = true;
 
-            let (sym, keycode, modifiers) = 
+            let (sym, keycode, modifiers, krange) = 
                 self.parse_keyscomb(
                     key, 
                     mainmod 
                 ).unwrap_or_else(|| {
                     error!("Failed to parse shortcut {}", key);
                     success = false;
-                    (xkb::Keysym(0), 0, ModMask::default())
+                    (xkb::Keysym(0), 0, ModMask::default(), KeyRange::None)
                 });
             if !success {continue;}
 
-            // TODO: maybe check result
-            let _ = self.conn.grab_key(
+            let mut cut = Keycut::new(
+                None, 
+                ModMask::default(), 
+                KeyRange::None
+            );
+
+            match krange {
+                KeyRange::Numbers => {
+                    for i in 1..10 {
+                        let keysym = match xkb::Keysym::from_str(&i.to_string()) {
+                            Ok(keysym) => keysym,
+                            Err(err) => {
+                                error!("Warning: Failed to parse keysym\
+                                    from '{}'", i);
+                                continue;
+                            }
+                        };
+
+                        let kc = match keysym_to_keycode(&self.conn, keysym) {
+                            Some(kc) => kc,
+                            None => {
+                                error!("Warning: Can't get keycode for {:?}",
+                                    keysym);
+                                continue;
+                            }
+                        };
+
+                        let _ = self.conn.grab_key(
+                            true, 
+                            self.screen.root, 
+                            modifiers,
+                            kc, 
+                            GrabMode::ASYNC, 
+                            GrabMode::ASYNC
+                        );
+                    }
+                    cut = Keycut::new(
+                        None,
+                        modifiers,
+                        KeyRange::Numbers
+                    );
+                }
+                KeyRange::Any => {
+                    let _ = self.conn.grab_key(
+                        true, 
+                        self.screen.root, 
+                        modifiers,
+                        0, 
+                        GrabMode::ASYNC, 
+                        GrabMode::ASYNC
+                    );
+                    cut = Keycut::new(
+                        None,
+                        modifiers,
+                        KeyRange::Any
+                    );
+                }
+                other => {
+                    let _ = self.conn.grab_key(
                         true, 
                         self.screen.root, 
                         modifiers,
                         keycode, 
                         GrabMode::ASYNC, 
                         GrabMode::ASYNC
-            );
-
-            let cut = Keycut::new(sym.into(), modifiers);
+                    );
+                    cut = Keycut::new(
+                        Some(sym.into()),
+                        modifiers,
+                        KeyRange::None
+                    );
+                }
+            }
 
             let task = match val {
                 ActionEnum::Command(c) => input::CutTask::Command(c.clone()),
@@ -351,7 +445,7 @@ impl<C: Connection> YATState<C> {
 
     /// Parses key combination and returns keysym, keycode  and modmask 
     fn parse_keyscomb(&mut self, key: &str, mainmod: ModMask) 
-        -> Option<(xkb::Keysym, u8, ModMask)> {
+        -> Option<(xkb::Keysym, u8, ModMask, KeyRange)> {
         let mut preproced = String::new();
         for k in key.split('+') {
             if k.starts_with('{') {
@@ -380,21 +474,9 @@ impl<C: Connection> YATState<C> {
         let mut mkey: Option<xkb::Keysym> = None;
         let mut kcode: Option<u8> = None;
         let mut success: bool = true;
+        let mut krange = KeyRange::None;
 
         for kst in keys_iter {
-            // let kst_e = if kst.starts_with('{') {
-            //     let cleaned = kst
-            //         .replace("{", "")
-            //         .replace("}", "");
-            //
-            //     self.try_macroexp(&cleaned).unwrap_or_else(|| {
-            //         error!("Unknown macro {}", cleaned);
-            //         kst.to_owned()
-            //     })
-            // } else {
-            //     kst.to_owned()
-            // };
-
             match kst.to_lowercase().as_str() {
                 "super" | "win" => {
                     modifiers |= ModMask::M4;    
@@ -410,6 +492,12 @@ impl<C: Connection> YATState<C> {
                 }
                 "mod" => {
                     modifiers |= mainmod;
+                }
+                "|wildcard|" | "|anykey|" => {
+                    krange = KeyRange::Any;
+                }
+                "|number|" | "|anynum|" => {
+                    krange = KeyRange::Numbers;
                 }
                 other => {
                     let sym = xkb::Keysym::from_str(other)
@@ -436,22 +524,31 @@ impl<C: Connection> YATState<C> {
         let keycode = match kcode {
             Some(v) => v,
             None => {
-                error!("CFGPARSE: Can't get keycode");
-                return None;
+                if matches!(krange, KeyRange::Any) || matches!(krange, KeyRange::Numbers) {
+                    0
+                } else {
+                    error!("CFGPARSE: Can't get keycode");
+                    return None;
+                }
             }
         };
 
         let sym = match mkey {
             Some(v) => v,
             None => {
-                error!("CFGPARSE: shortcut must have a key");
-                return None;
+                if matches!(krange, KeyRange::Any) || matches!(krange, KeyRange::Numbers) {
+                    xkb::Keysym(0)
+                } else {
+                    error!("CFGPARSE: Shortcut must have a key or a placeholder");
+                    return None;
+                }       
             }
         };
-        Some((sym, keycode, modifiers))
+        Some((sym, keycode, modifiers, krange))
     }
 
-    fn exec_action(&mut self, action: &ActionEnum) 
+    /// Executes action. `addi` is additional key used for macros
+    fn exec_action(&mut self, action: &ActionEnum, addi: &str) 
         -> Result<(), Box<dyn std::error::Error>> {
         
         match action {
@@ -552,8 +649,7 @@ impl<C: Connection> YATState<C> {
             ActionEnum::CfgReload(_) => {
                 self.reload_cfg()?;
             }
-            ActionEnum::ExpandMacro(name) => {
-                // TODO: parametrized macros
+            ActionEnum::ExpandMacro(name, arg) => {
                 // TODO: remove clone here for better perf 
                 let macros = self.macros.get(name).ok_or(CustomError {
                     message: format!("Can't get macro {}", name)
@@ -562,8 +658,33 @@ impl<C: Connection> YATState<C> {
                 match macros {
                     CfgMacro::DefineActions(v) => {
                         for act in v.iter() {
-                            self.exec_action(act)?;
+                            self.exec_action(act, addi)?;
                         }
+                    }
+                    CfgMacro::ReplaceAll(v, a) => {
+                        let exp_arg = if matches!(arg, ActionValue::GetFromCut) {
+                            if addi.chars().all(char::is_numeric) {
+                                ActionValue::Uint(addi.parse()?)
+                            } else {
+                                ActionValue::Str(addi.to_string())
+                            }
+                        } else {
+                            arg.clone()
+                        };
+
+                        if std::mem::discriminant(&exp_arg) != 
+                            std::mem::discriminant(&a) {
+                            return Err(Box::new(CustomError {
+                                message: format!(
+                                "Type error: passed {:?} but {:?} was expected",
+                                arg, a)}));
+                        }
+
+                        let new = exp_arg.clone();
+                        for act in v.iter() {
+                            let changed = act.replace_val(&new)?.clone();
+                            self.exec_action(&changed, addi)?;
+                        } 
                     }
                     other => {
                         error!("Unimplemnted macro expand {:?}", other);
@@ -573,7 +694,7 @@ impl<C: Connection> YATState<C> {
             }
             ActionEnum::Complex(v) => {
                 for act in v {
-                    self.exec_action(act)?;
+                    self.exec_action(act, addi)?;
                 }
             }
             other => {

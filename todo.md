@@ -1,8 +1,11 @@
-- macros `or`, `and`, etc
-- macros getval
+- ewmh
+- conditions?
+- make `replace_all` replace only matching types
+- command palette
 
 next:
-- parametrized macros
 - macros wiki
-- lua
+- `kill` shortcut
+- gaps, topbars
+- lua?
 - yatstatus?
